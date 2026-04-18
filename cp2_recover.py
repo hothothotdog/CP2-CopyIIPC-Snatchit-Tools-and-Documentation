@@ -189,22 +189,116 @@ def guess_bpb_from_clusters(disk: dict) -> BPB | None:
     return None
 
 
-# ── LBA map ───────────────────────────────────────────────────────────────────
+# FAT12 media descriptor → disk geometry for early PC-DOS single/double-sided formats.
+# These predate the BPB and rely solely on the first byte of the FAT.
+# (head, spt, cyls, reserved, num_fats, fat_secs, root_entries, spc)
+MEDIA_GEOMETRIES = {
+    0xFF: (2,  8, 40, 1, 2, 1,  64, 1),  # 320 KB  double-sided 8-sector
+    0xFE: (1,  8, 40, 1, 2, 1,  64, 1),  # 160 KB  single-sided 8-sector  ← Bank Street Writer etc.
+    0xFD: (2,  9, 40, 1, 2, 2, 112, 2),  # 360 KB  double-sided 9-sector
+    0xFC: (1,  9, 40, 1, 2, 2,  64, 1),  # 180 KB  single-sided 9-sector
+    0xFB: (2,  8, 80, 1, 2, 2, 112, 2),  # 640 KB  double-sided 8-sector 80-track
+    0xFA: (1,  8, 80, 1, 2, 2,  64, 1),  # 320 KB  single-sided 8-sector 80-track (rare)
+    0xF9: (2,  9, 80, 1, 2, 3, 112, 2),  # 720 KB  (also used for 1.2 MB; resolved below)
+    0xF0: (2, 18, 80, 1, 2, 9, 224, 2),  # 1.44 MB (default; 2.88 MB also uses F0)
+}
+
+def guess_bpb_from_fat_media(disk: dict, lba_map: dict, spt: int) -> BPB | None:
+    """
+    Read the FAT media descriptor byte from the first FAT sector and use it
+    to reconstruct a BPB for early PC-DOS formats that predate the BPB field
+    (or use a non-standard boot sector jump).
+
+    The FAT is at LBA 1 on a standard single-FAT layout (reserved=1 sector).
+    If the first byte of that sector is a known media descriptor (0xFE–0xFF
+    or 0xF0), and the second and third bytes are both 0xFF (the standard
+    FAT12 padding), we treat the layout as definitive.
+    """
+    fat_sector = read_lba(lba_map, 1)
+    med  = fat_sector[0]
+    pad1 = fat_sector[1]
+    pad2 = fat_sector[2]
+
+    if med not in MEDIA_GEOMETRIES or pad1 != 0xFF or pad2 != 0xFF:
+        log.debug("guess_bpb_from_fat_media: LBA 1 first bytes %02X %02X %02X — not a FAT",
+                  med, pad1, pad2)
+        return None
+
+    nhead, spt_fat, cyls, res, nfat, fatsz, rde, spc = MEDIA_GEOMETRIES[med]
+
+    # For 0xF9 distinguish 720 KB (9 spt) from 1.2 MB (15 spt) using inferred spt
+    if med == 0xF9 and spt == 15:
+        nhead, spt_fat, cyls, res, nfat, fatsz, rde, spc = (2, 15, 80, 1, 2, 7, 224, 1)
+
+    rds        = (rde * 32 + 511) // 512
+    data_start = res + nfat * fatsz + rds
+    tsec       = cyls * nhead * spt_fat
+    tc         = (tsec - data_start) // spc if spc else 0
+
+    log.info("BPB      : inferred from FAT media byte 0x%02X → %d cyl × %d head × %d spt (%d KB)",
+             med, cyls, nhead, spt_fat, tsec * 512 // 1024)
+
+    return BPB(
+        oem_name          = f"(media=0x{med:02X})",
+        bytes_per_sector  = 512,
+        sectors_per_clus  = spc,
+        reserved_sectors  = res,
+        num_fats          = nfat,
+        root_entry_count  = rde,
+        total_sectors_16  = tsec,
+        media_byte        = med,
+        fat_size_16       = fatsz,
+        sectors_per_track = spt_fat,
+        num_heads         = nhead,
+        root_dir_start    = res + nfat * fatsz,
+        root_dir_sectors  = rds,
+        data_start        = data_start,
+        total_clusters    = tc,
+    )
+
+def _logical_spt(smap: dict) -> int:
+    """
+    Return the logical sectors-per-track for one track's sector map.
+
+    Standard floppies number sectors 1..N consecutively.  Copy-protected
+    disks often interleave non-standard sector numbers (e.g. 10, 12, 14…27)
+    among the real data sectors.  Using max(smap.keys()) on such a track
+    would return 27 instead of 8, exploding the inferred geometry.
+
+    This function returns the length of the unbroken consecutive run
+    1, 2, 3, … starting from sector 1 (only counting sector numbers in
+    the standard floppy range [1..18]).  If no such run exists it falls
+    back to max(smap.keys()) — the legacy behaviour for unusual disks.
+    """
+    secs = sorted(s for s in smap.keys() if 1 <= s <= 18)
+    run = 0
+    for s in secs:
+        if s == run + 1:
+            run = s
+        else:
+            break
+    return run if run > 0 else (max(smap.keys()) if smap else 0)
+
 
 def infer_disk_geometry(disk: dict):
     """Return (max_cyl, num_heads, spt) from the parsed CP2 sector dict.
     Corrupt track headers are filtered out via filter_disk() before geometry
-    is inferred, preventing garbage head values from inflating the output."""
+    is inferred, preventing garbage head values from inflating the output.
+    Non-sequential (copy-protection) sector numbering is handled by
+    _logical_spt(), which detects the real consecutive run 1..N rather than
+    using the raw maximum sector number."""
     disk = filter_disk(disk)
     if not disk:
         raise ValueError("Empty disk dict after filtering")
     num_heads = max(h for _, h in disk) + 1
-    sec_counts = [max(smap.keys()) for smap in disk.values() if smap]
+    # Use logical SPT (consecutive run from 1) not raw max sector number
+    sec_counts = [_logical_spt(smap) for smap in disk.values() if smap]
     spt = max(set(sec_counts), key=sec_counts.count)
     all_cyls = sorted(set(c for c, _ in disk))
     true_max = 0
     for cyl in all_cyls:
-        if all(len(disk.get((cyl, h), {})) >= spt for h in range(num_heads)):
+        if all(_logical_spt(disk.get((cyl, h), {})) >= spt
+               for h in range(num_heads)):
             true_max = cyl
     max_cyl = true_max + 1
     for std in [40, 80]:
@@ -272,7 +366,12 @@ class DirEntry:
         """True if this is a regular extractable file."""
         if self.is_deleted:
             return False
-        if self.attr & (ATTR_VOLUME_ID | ATTR_DIRECTORY | ATTR_LONG_NAME):
+        # LFN entry: all four attribute bits set simultaneously (exactly 0x0F).
+        # Must use equality, not bitwise AND — attr=0x06 (READONLY|HIDDEN) is a
+        # perfectly valid system file (e.g. IBMBIO.COM) and must not be rejected.
+        if self.attr == ATTR_LONG_NAME:
+            return False
+        if self.attr & (ATTR_VOLUME_ID | ATTR_DIRECTORY):
             return False
         if self.file_size == 0:
             return False
@@ -463,7 +562,9 @@ def walk_directory(
                                skip_zero_sectors=skip_zero_sectors)
 
     for de in entries:
-        # ── Skip . and .. ────────────────────────────────────────────────────
+        # ── Skip deleted and . / .. entries ──────────────────────────────────
+        if de.is_deleted:
+            continue
         name = de.raw_name.rstrip()
         if name in (".", ".."):
             continue
@@ -667,7 +768,7 @@ def write_output(
             'start_lba': lba, 'byte_size': len(data),
         })
 
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     lines = [
         "cp2_recover — recovery summary",
@@ -689,7 +790,7 @@ def write_output(
     for i, (lba, ext, data) in enumerate(carved):
         lines.append(f"  carved_{i:04d}.{ext:<20}  {'?':<5} {'?':>8} {len(data):>10} {lba:>6}  CARVED")
 
-    (out_dir / "summary.txt").write_text("\n".join(lines) + "\n")
+    (out_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     log.info("Wrote %d file(s) to %s", len(recovered) + len(carved), out_dir)
 
 
@@ -767,11 +868,16 @@ def main():
     if bpb:
         log.info("BPB      : read OK")
     else:
-        log.warning("BPB      : unreadable — trying standard geometries")
-        bpb = guess_bpb_from_clusters(disk)
-        if not bpb:
-            log.error("Could not determine disk geometry. Use --data-start and --spc.")
-            sys.exit(1)
+        # Second attempt: infer from FAT media descriptor byte (PC-DOS 1.x era)
+        bpb = guess_bpb_from_fat_media(disk, lba_map, spt)
+        if bpb:
+            log.info("BPB      : derived from FAT media descriptor 0x%02X", bpb.media_byte)
+        else:
+            log.warning("BPB      : unreadable — trying standard geometries")
+            bpb = guess_bpb_from_clusters(disk)
+            if not bpb:
+                log.error("Could not determine disk geometry. Use --data-start and --spc.")
+                sys.exit(1)
 
     # Apply CLI overrides
     if args.data_start is not None:
