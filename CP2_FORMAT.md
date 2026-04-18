@@ -1,7 +1,9 @@
 # SOFTWARE PIRATES CP2 Disk Image Format
 
 A reverse-engineered specification of the `.cp2` floppy disk image format
-produced by the **SOFTWARE PIRATES** disk imaging utility for DOS.
+CP2 is the native image format of the CopyII PC / Snatchit disk imaging
+utilities by Central Point Software produced by the **SOFTWARE PIRATES**
+disk imaging utility for DOS.
 
 This document was produced by analysing real CP2 files — including several
 with structural corruption — alongside the C source of Hampa Hug's
