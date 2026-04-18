@@ -1,9 +1,9 @@
 # cp2-tools
 
 A Python toolkit for converting, recovering, and validating floppy disk
-images in the **SOFTWARE PIRATES `.cp2`** format.
+images in the CopyII PC and Snatchit **SOFTWARE PIRATES `.cp2`** format.
 
-The CP2 format was produced by the SOFTWARE PIRATES disk imaging utility
+The CP2 format was produced as a disk imaging utility
 for DOS (versions 3.02 – 6.0). It stores raw FDC read results track by
 track, including sector status flags and an interleaved sector data block.
 See [`CP2_FORMAT.md`](CP2_FORMAT.md) for the full format specification.
