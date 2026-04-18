@@ -1,362 +1,463 @@
 #!/usr/bin/env python3
 """
 cp2_carve.py  —  File carver for SOFTWARE PIRATES .cp2 disk images
-
-Scans the raw sector stream for known file-type signatures and extracts
-them. Works entirely in-memory on the parsed CP2 sector dict — no .img
-file is written.  FAT corruption is irrelevant; only the sector payload
-bytes matter.
+Works directly on the parsed sector dict from cp2_to_img.py.
+Does NOT require a healthy FAT — scans raw sector data for known file signatures.
 
 Usage:
     python cp2_carve.py disk.cp2
     python cp2_carve.py disk.cp2 --out ./recovered
-    python cp2_carve.py disk.cp2 --window 65536    # bytes to pull per hit
-    python cp2_carve.py disk.cp2 --min-size 64     # skip tiny hits
-    python cp2_carve.py disk.cp2 --verbose
-    python cp2_carve.py disk.cp2 --list-sigs        # show signature table
+    python cp2_carve.py disk.cp2 --aggressive          # also carve .COM files (noisy)
+    python cp2_carve.py disk.cp2 --min-size 64         # skip tiny hits (bytes)
+    python cp2_carve.py disk.cp2 --max-size 512000     # cap carve size per file
+    python cp2_carve.py disk.cp2 --probe               # show sector map + hits only
 
-Requires cp2_to_img.py (load_cp2) in the same directory.
+Requires cp2_to_img.py in the same directory (or on PYTHONPATH).
 """
 
 import sys
 import os
-import struct
 import argparse
 import logging
+import json
 from pathlib import Path
+from dataclasses import dataclass, field, asdict
+
+try:
+    from cp2_to_img import load_cp2
+except ImportError:
+    sys.exit("ERROR: cp2_to_img.py not found. Place it alongside this script.")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Pull load_cp2 from the sibling script ────────────────────────────────────
 
-script_dir = Path(__file__).parent
-sys.path.insert(0, str(script_dir))
-try:
-    from cp2_to_img import load_cp2          # standard name
-except ModuleNotFoundError:
-    from importlib.util import spec_from_file_location, module_from_spec
-    _candidates = list(Path(script_dir).glob("*cp2_to_img*.py")) + \
-                  list(Path(script_dir).glob("*cp2*.py"))
-    _candidates = [p for p in _candidates if p.name != Path(__file__).name]
-    if not _candidates:
-        sys.exit("ERROR: Cannot find cp2_to_img.py — place it alongside this script.")
-    _spec   = spec_from_file_location("cp2_to_img", _candidates[0])
-    _module = module_from_spec(_spec)
-    _spec.loader.exec_module(_module)
-    load_cp2 = _module.load_cp2
-    log.info("Imported load_cp2 from %s", _candidates[0].name)
-
-
-# ── Signature table ───────────────────────────────────────────────────────────
-# Each entry: (magic_bytes, offset_within_header, extension, description)
-# offset_within_header: how far into a potential file the magic appears
-# (almost always 0, but LHA stores its magic at offset 2)
+# ── File signature table ──────────────────────────────────────────────────────
+# (magic_bytes, extension, description)
+# Ordered longest-magic-first so more-specific entries match before shorter ones.
 
 SIGNATURES = [
-    # ── Executables ──────────────────────────────────────────────────────────
-    (b"MZ",                     0,  ".exe",  "DOS/Windows Executable"),
-    (b"\xe9",                   0,  ".com",  "DOS COM (JMP rel16)"),   # common COM opening byte
-    (b"\xeb",                   0,  ".com",  "DOS COM (JMP short)"),   # short-jump COM
-
-    # ── Archives (very common on DOS era floppies) ────────────────────────────
-    (b"PK\x03\x04",             0,  ".zip",  "ZIP archive"),
-    (b"PK\x05\x06",             0,  ".zip",  "ZIP empty/end-of-central"),
-    (b"\x60\xea",               0,  ".arj",  "ARJ archive"),
-    (b"\x1a\x08",               0,  ".arc",  "ARC archive (type 8)"),
-    (b"\x1a\x09",               0,  ".arc",  "ARC archive (type 9)"),
-    (b"\x1a\x0a",               0,  ".arc",  "ARC archive (type 10)"),
-    (b"Rar!",                   0,  ".rar",  "RAR archive"),
-    (b"\x1f\x8b",               0,  ".gz",   "GZIP stream"),
-    (b"BZh",                    0,  ".bz2",  "BZIP2 stream"),
-
-    # LHA/LZH: magic is at byte offset 2 inside the header ("-lh0-" etc.)
-    (b"-lh0-",                  2,  ".lzh",  "LHA/LZH level-0 (stored)"),
-    (b"-lh1-",                  2,  ".lzh",  "LHA/LZH level-0 lh1"),
-    (b"-lh4-",                  2,  ".lzh",  "LHA/LZH lh4"),
-    (b"-lh5-",                  2,  ".lzh",  "LHA/LZH lh5"),
-    (b"-lzs-",                  2,  ".lzh",  "LHA/LZH lzs"),
-    (b"-lz4-",                  2,  ".lzh",  "LHA/LZH lz4"),
-
-    # ── Images ───────────────────────────────────────────────────────────────
-    (b"BM",                     0,  ".bmp",  "BMP bitmap"),
-    (b"GIF87a",                 0,  ".gif",  "GIF 87a"),
-    (b"GIF89a",                 0,  ".gif",  "GIF 89a"),
-    (b"\xff\xd8\xff",           0,  ".jpg",  "JPEG image"),
-    (b"\x89PNG\r\n\x1a\n",     0,  ".png",  "PNG image"),
-    (b"RIFF",                   0,  ".wav",  "RIFF/WAV audio"),
-
-    # ── Text / data ───────────────────────────────────────────────────────────
-    # Plain text: we detect long ASCII runs separately (see scan_text)
-    (b"\xff\xfe",               0,  ".txt",  "UTF-16 LE text (BOM)"),
-    (b"\xfe\xff",               0,  ".txt",  "UTF-16 BE text (BOM)"),
-    (b"\xef\xbb\xbf",          0,  ".txt",  "UTF-8 BOM text"),
-
-    # ── DOS / PC specific ─────────────────────────────────────────────────────
-    (b"\xeb\x3c\x90",           0,  ".img",  "FAT boot sector (EB 3C 90)"),
-    (b"\xeb\x58\x90",           0,  ".img",  "FAT boot sector (EB 58 90)"),
-    (b"MSDOS",                  3,  ".img",  "MS-DOS OEM ID in boot sector"),
+    # ── Archives (very common on DOS software disks) ──────────────────────────
+    (b'PK\x03\x04',            'zip',  'ZIP Archive'),
+    (b'PK\x05\x06',            'zip',  'ZIP Archive (empty central dir)'),
+    (b'Rar!\x1a\x07\x01\x00',  'rar',  'RAR v5+'),
+    (b'Rar!\x1a\x07\x00',      'rar',  'RAR v1.5+'),
+    (b'\x60\xea',              'arj',  'ARJ Archive'),
+    (b'-lh0-',                 'lzh',  'LZH-0 (stored)'),
+    (b'-lh5-',                 'lzh',  'LZH-5'),
+    (b'-lh6-',                 'lzh',  'LZH-6'),
+    (b'-lh7-',                 'lzh',  'LZH-7'),
+    (b'LHA ',                  'lzh',  'LHA Archive'),
+    (b'\x1f\xa0',              'lzh',  'LZH compressed'),
+    (b'\x1f\x9d',              'lzh',  'LZH compressed (variant)'),
+    (b'\x1a\x0b',              'arc',  'ARC Archive (v1)'),
+    (b'\x1a\x08',              'arc',  'ARC Archive (v8)'),
+    (b'\x1a\x09',              'arc',  'ARC Archive (v9)'),
+    (b'\x1f\x8b',              'gz',   'GZIP'),
+    (b'BZh',                   'bz2',  'BZIP2'),
+    (b'\xfd7zXZ\x00',          'xz',   'XZ Stream'),
+    # ── MS-compressed executables (common on install floppies) ────────────────
+    (b'SZDD\x88\xf0\x27\x33',  'exe',  'MS-Compressed EXE (SZDD)'),
+    (b'KWAJ\x88\xf0\x27\xd1',  'exe',  'MS-Compressed EXE (KWAJ)'),
+    # ── DOS/Windows executables ───────────────────────────────────────────────
+    (b'MZ',                    'exe',  'DOS/Windows Executable (MZ)'),
+    (b'ZM',                    'exe',  'DOS Executable (ZM, reversed MZ)'),
+    # ── Images ────────────────────────────────────────────────────────────────
+    (b'\x89PNG\r\n\x1a\n',     'png',  'PNG Image'),
+    (b'GIF89a',                'gif',  'GIF89a Image'),
+    (b'GIF87a',                'gif',  'GIF87a Image'),
+    (b'\xff\xd8\xff\xe0',      'jpg',  'JPEG/JFIF Image'),
+    (b'\xff\xd8\xff\xe1',      'jpg',  'JPEG/Exif Image'),
+    (b'\xff\xd8\xff\xdb',      'jpg',  'JPEG Image'),
+    (b'BM',                    'bmp',  'Windows Bitmap'),
+    (b'II*\x00',               'tif',  'TIFF (little-endian)'),
+    (b'MM\x00*',               'tif',  'TIFF (big-endian)'),
+    (b'\x0a\x05\x01',          'pcx',  'PCX Image (v5)'),
+    (b'\x0a\x03\x01',          'pcx',  'PCX Image (v3)'),
+    (b'\x0a\x02\x01',          'pcx',  'PCX Image (v2)'),
+    # ── Audio ─────────────────────────────────────────────────────────────────
+    (b'RIFF',                  'wav',  'RIFF container (WAV/AVI)'),
+    (b'Creative Voice File',   'voc',  'Creative Labs VOC Audio'),
+    (b'ID3',                   'mp3',  'MP3 with ID3 tag'),
+    (b'\xff\xfb',              'mp3',  'MP3 frame (MPEG1 L3 CBR)'),
+    (b'\xff\xf3',              'mp3',  'MP3 frame (MPEG2 L3)'),
+    (b'OggS',                  'ogg',  'OGG container'),
+    (b'FORM',                  'iff',  'IFF container (8SVX/AIFF)'),
+    # ── Documents ─────────────────────────────────────────────────────────────
+    (b'%PDF-',                 'pdf',  'PDF Document'),
+    (b'{\\rtf',                'rtf',  'Rich Text Format'),
+    (b'\xd0\xcf\x11\xe0',      'doc',  'MS Office OLE2 Document'),
+    # ── DOS batch / script ────────────────────────────────────────────────────
+    (b'@ECHO OFF',             'bat',  'DOS Batch File'),
+    (b'@echo off',             'bat',  'DOS Batch File'),
+    (b'@ECHO ON',              'bat',  'DOS Batch File'),
+    # ── Boot sectors ─────────────────────────────────────────────────────────
+    (b'\xeb\x3c\x90',          'boot', 'Boot sector (FAT16 BPB)'),
+    (b'\xeb\x58\x90',          'boot', 'Boot sector (FAT32 BPB)'),
+    (b'\xeb\x34\x90',          'boot', 'Boot sector (FAT12/16)'),
 ]
 
-# Minimum printable-ASCII run length to flag as a plain text file
-TEXT_MIN_RUN = 64
+# Aggressive-mode COM heuristics — high false-positive rate, opt-in only
+COM_SIGNATURES = [
+    (b'\xe9',     'com', 'DOS COM (JMP near)'),
+    (b'\xeb',     'com', 'DOS COM (JMP short)'),
+    (b'\xb4',     'com', 'DOS COM (MOV AH,...)'),
+    (b'\xcd\x21', 'com', 'DOS COM (INT 21h at byte 0)'),
+]
 
 
-# ── Disk linearisation ────────────────────────────────────────────────────────
+def _build_index(sigs):
+    """Build first-byte → [(magic, ext, desc), ...] lookup, longest-first."""
+    idx = {}
+    for magic, ext, desc in sigs:
+        idx.setdefault(magic[0], []).append((magic, ext, desc))
+    for b0 in idx:
+        idx[b0].sort(key=lambda t: -len(t[0]))
+    return idx
 
-def linearise(disk: dict, sectors_per_track: int = 9, num_heads: int = 2) -> bytes:
-    """
-    Flatten the (cyl, head) → {sec: bytes} dict into a single linear byte
-    stream in CHS order (same ordering as build_img).  Geometry is auto-
-    detected from the disk dict if possible, then snapped to standard values.
-    """
+SIG_INDEX     = _build_index(SIGNATURES)
+COM_SIG_INDEX = _build_index(COM_SIGNATURES)
+
+
+# ── Geometry inference (mirrors build_img logic from cp2_to_img.py) ───────────
+
+def infer_geometry(disk: dict) -> tuple:
+    """Returns (max_cyl, num_heads, sectors_per_track) from the sector dict."""
     if not disk:
-        raise ValueError("Empty disk dict")
+        raise ValueError("Empty disk dict — nothing parsed from CP2")
 
-    # Detect geometry from data
-    detected_heads = max(h for _, h in disk) + 1
-    detected_cyls  = max(c for c, _ in disk) + 1
-    detected_spt   = max(
-        (max(smap.keys()) for smap in disk.values() if smap),
-        default=9
-    )
+    num_heads = max(h for _, h in disk) + 1
 
-    # Snap SPT to a known floppy format
-    for std_spt in (8, 9, 15, 18, 36):
-        if abs(detected_spt - std_spt) <= 1:
-            detected_spt = std_spt
+    sec_counts = [max(smap.keys()) for smap in disk.values() if smap]
+    spt        = max(set(sec_counts), key=sec_counts.count)
+
+    all_cyls = sorted(set(c for c, _ in disk))
+    true_max_cyl = 0
+    for cyl in all_cyls:
+        if all(len(disk.get((cyl, h), {})) >= spt for h in range(num_heads)):
+            true_max_cyl = cyl
+    max_cyl = true_max_cyl + 1
+
+    for std in [40, 80]:
+        if abs(max_cyl - std) <= 2 and max_cyl <= std:
+            log.info("Snapping geometry to %d cylinders", std)
+            max_cyl = std
             break
 
-    log.info("Linearising: %d cyls × %d heads × %d spt",
-             detected_cyls, detected_heads, detected_spt)
+    return max_cyl, num_heads, spt
 
-    stream = bytearray()
-    for cyl in range(detected_cyls):
-        for head in range(detected_heads):
+
+# ── Flat LBA view ─────────────────────────────────────────────────────────────
+
+def build_lba_map(disk: dict, max_cyl: int, num_heads: int, spt: int) -> dict:
+    """
+    Build LBA → bytes mapping using standard CHS→LBA formula:
+        lba = (cyl * num_heads + head) * spt + (sec - 1)
+
+    Missing sectors map to None (distinguishable from stored zero sectors).
+    """
+    lba_map = {}
+    for cyl in range(max_cyl):
+        for head in range(num_heads):
             smap = disk.get((cyl, head), {})
-            for sec in range(1, detected_spt + 1):
-                data = smap.get(sec, bytes(512))
-                if len(data) < 512:
-                    data = data.ljust(512, b"\x00")
-                stream.extend(data[:512])
-
-    return bytes(stream)
+            for sec in range(1, spt + 1):
+                lba = (cyl * num_heads + head) * spt + (sec - 1)
+                lba_map[lba] = smap.get(sec)
+    return lba_map
 
 
-# ── EXE size heuristic ────────────────────────────────────────────────────────
+# ── Carve result ──────────────────────────────────────────────────────────────
 
-def exe_size_hint(data: bytes) -> int | None:
+@dataclass
+class CarvedFile:
+    index:        int
+    ext:          str
+    description:  str
+    start_lba:    int
+    end_lba:      int
+    sector_count: int
+    byte_size:    int
+    truncated:    bool   # hit --max-size cap
+    zero_stopped: bool   # stopped on all-zero sector
+    data:         bytes  = field(repr=False, default=b'')
+
+    @property
+    def filename(self) -> str:
+        return f"carved_{self.index:04d}.{self.ext}"
+
+
+# ── Core carver ───────────────────────────────────────────────────────────────
+
+ZERO_SECTOR = bytes(512)
+
+def scan_and_carve(
+    lba_map:    dict,
+    total_lbas: int,
+    aggressive: bool = False,
+    min_size:   int  = 16,
+    max_size:   int  = 0,
+) -> list:
     """
-    Read the MZ header to estimate file size.
-    Returns byte count or None if the header looks malformed.
+    Single forward pass over all LBAs.
+
+    On a magic-byte hit: greedily collect contiguous sectors into one file.
+
+    Stop conditions:
+      1. Sector is missing (None) from parsed CP2 data
+      2. Sector is all-zeros (unallocated gap)
+      3. Sector starts a NEW signature hit (next file begins here)
+      4. --max-size cap reached
+      5. End of disk
     """
-    if len(data) < 28 or data[:2] != b"MZ":
-        return None
-    e_cblp = struct.unpack_from("<H", data, 2)[0]   # bytes in last 512-byte page
-    e_cp   = struct.unpack_from("<H", data, 4)[0]   # total 512-byte pages
-    if e_cp == 0:
-        return None
-    size = (e_cp - 1) * 512 + (e_cblp if e_cblp else 512)
-    # Sanity: must be at least a header and not absurdly large
-    if size < 64 or size > 2 * 1024 * 1024:
-        return None
-    return size
+    sig_idx = dict(SIG_INDEX)
+    if aggressive:
+        for b0, entries in COM_SIG_INDEX.items():
+            sig_idx.setdefault(b0, []).extend(entries)
+        log.warning("Aggressive mode ON — COM heuristics active (expect false positives)")
 
+    max_sectors = (max_size // 512) if max_size else 0
+    claimed     = set()   # LBAs already consumed by a previous carve
+    results     = []
+    idx         = 0
 
-# ── Plain-text detection ──────────────────────────────────────────────────────
-
-def find_text_runs(stream: bytes, min_run: int = TEXT_MIN_RUN):
-    """
-    Yield (offset, length) for every run of printable ASCII + common
-    whitespace that is at least min_run bytes long.
-    """
-    PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
-    i = 0
-    n = len(stream)
-    while i < n:
-        if stream[i] in PRINTABLE:
-            j = i + 1
-            while j < n and stream[j] in PRINTABLE:
-                j += 1
-            run_len = j - i
-            if run_len >= min_run:
-                yield i, run_len
-            i = j
-        else:
-            i += 1
-
-
-# ── Main carver ───────────────────────────────────────────────────────────────
-
-class Hit:
-    __slots__ = ("offset", "ext", "desc", "data")
-
-    def __init__(self, offset, ext, desc, data):
-        self.offset = offset
-        self.ext    = ext
-        self.desc   = desc
-        self.data   = data
-
-
-def carve(stream: bytes, window: int, min_size: int) -> list:
-    """
-    Scan the linear byte stream for all known signatures.
-    Returns a list of Hit objects.
-    """
-    hits    = []
-    seen    = set()   # deduplicate overlapping hits at the same offset
-
-    n = len(stream)
-
-    # ── Signature scan ────────────────────────────────────────────────────────
-    for magic, hdr_offset, ext, desc in SIGNATURES:
-        mlen  = len(magic)
-        start = 0
-        while True:
-            pos = stream.find(magic, start)
-            if pos < 0:
-                break
-            start = pos + 1
-
-            file_start = pos - hdr_offset
-            if file_start < 0:
-                continue
-            if (file_start, ext) in seen:
-                continue
-            seen.add((file_start, ext))
-
-            # For EXE files, try to use the MZ header to get the real size
-            extract_len = window
-            if ext == ".exe":
-                hint = exe_size_hint(stream[file_start:file_start + 512])
-                if hint:
-                    extract_len = min(hint + 512, window)   # +512 for overlays
-
-            raw = stream[file_start: file_start + extract_len]
-
-            if len(raw) < min_size:
-                log.debug("  skip %s @0x%X: too small (%d < %d)",
-                          ext, file_start, len(raw), min_size)
-                continue
-
-            hits.append(Hit(file_start, ext, desc, raw))
-
-    # ── Plain-text scan ───────────────────────────────────────────────────────
-    for offset, length in find_text_runs(stream, TEXT_MIN_RUN):
-        key = (offset, ".txt")
-        if key in seen:
+    for lba in range(total_lbas):
+        if lba in claimed:
             continue
-        seen.add(key)
-        raw = stream[offset: offset + min(length, window)]
-        if len(raw) >= min_size:
-            hits.append(Hit(offset, ".txt", "Plain ASCII text run", raw))
 
-    # Sort by file offset
-    hits.sort(key=lambda h: h.offset)
-    return hits
+        sector_data = lba_map.get(lba)
+        if sector_data is None or sector_data == ZERO_SECTOR:
+            continue
+
+        # Pre-filter: check first byte against index
+        candidates = sig_idx.get(sector_data[0])
+        if not candidates:
+            continue
+
+        # Find best (longest) matching signature
+        matched = None
+        for magic, ext, desc in candidates:
+            if sector_data[:len(magic)] == magic:
+                matched = (magic, ext, desc)
+                break
+        if matched is None:
+            continue
+
+        _, match_ext, match_desc = matched
+
+        # ── Greedy collection ─────────────────────────────────────────────────
+        collected    = bytearray()
+        cur          = lba
+        truncated    = False
+        zero_stopped = False
+
+        while cur < total_lbas:
+            chunk = lba_map.get(cur)
+
+            # Stop: sector absent from CP2 parse
+            if chunk is None:
+                break
+
+            # Stop: zero sector (treat as unallocated), but not the first sector
+            if cur != lba and chunk == ZERO_SECTOR:
+                zero_stopped = True
+                break
+
+            # Stop: new signature starts here (but not at the anchor LBA)
+            if cur != lba:
+                new_cands = sig_idx.get(chunk[0], [])
+                if any(chunk[:len(m)] == m for m, _, _ in new_cands):
+                    break
+
+            collected.extend(chunk)
+            claimed.add(cur)
+            cur += 1
+
+            # Stop: max-size cap
+            if max_sectors and (cur - lba) >= max_sectors:
+                truncated = True
+                break
+
+        data = bytes(collected)
+        if len(data) < min_size:
+            log.debug("LBA %d: hit below min_size (%d bytes) — skipping", lba, len(data))
+            continue
+
+        cf = CarvedFile(
+            index        = idx,
+            ext          = match_ext,
+            description  = match_desc,
+            start_lba    = lba,
+            end_lba      = cur - 1,
+            sector_count = cur - lba,
+            byte_size    = len(data),
+            truncated    = truncated,
+            zero_stopped = zero_stopped,
+            data         = data,
+        )
+        results.append(cf)
+        flags = ("  [TRUNCATED]" if truncated else "") + ("  [ZERO-STOP]" if zero_stopped else "")
+        log.info("  [%04d] LBA %-5d  %-6s  %7d bytes  %s%s",
+                 idx, lba, match_ext, len(data), match_desc, flags)
+        idx += 1
+
+    return results
+
+
+# ── Probe / sector map ────────────────────────────────────────────────────────
+
+def probe_sectors(lba_map: dict, total_lbas: int, sig_idx: dict) -> None:
+    """Print a compact visual sector map, collapsing empty runs."""
+    print(f"\nSector map  ({total_lbas} LBAs × 512 bytes)\n")
+    print(f"  {'LBA':<7} {'Type':<8} First 16 bytes (hex)")
+    print(f"  {'─'*7} {'─'*8} {'─'*47}")
+
+    empty_run = 0
+    for lba in range(total_lbas):
+        data = lba_map.get(lba)
+        empty = data is None or data == ZERO_SECTOR
+        if empty:
+            empty_run += 1
+            continue
+
+        if empty_run:
+            print(f"  ... {empty_run} empty/missing sector(s) ...")
+            empty_run = 0
+
+        label = "data"
+        cands = sig_idx.get(data[0], [])
+        for magic, ext, _ in cands:
+            if data[:len(magic)] == magic:
+                label = ext.upper()
+                break
+
+        print(f"  {lba:<7} {label:<8} {data[:16].hex(' ')}")
+
+    if empty_run:
+        print(f"  ... {empty_run} empty/missing sector(s) ...")
+    print()
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
-def save_hits(hits: list, out_dir: str) -> int:
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    saved = 0
-    ext_counts = {}
+def write_results(results: list, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    for hit in hits:
-        n = ext_counts.get(hit.ext, 0)
-        ext_counts[hit.ext] = n + 1
-        sector = hit.offset // 512
-        fname  = f"carved_{sector:05d}_hit{n:03d}{hit.ext}"
-        fpath  = os.path.join(out_dir, fname)
+    manifest = []
+    for cf in results:
+        (out_dir / cf.filename).write_bytes(cf.data)
+        entry = {k: v for k, v in asdict(cf).items() if k != 'data'}
+        entry['filename'] = cf.filename
+        manifest.append(entry)
 
-        with open(fpath, "wb") as f:
-            f.write(hit.data)
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-        log.info("  [0x%07X / sector %5d]  %-8s  %d bytes  ← %s",
-                 hit.offset, sector, hit.ext, len(hit.data), hit.desc)
-        saved += 1
+    lines = [
+        "cp2_carve — recovery summary",
+        "─" * 65,
+        f"Total files carved : {len(results)}",
+        f"Output directory   : {out_dir.resolve()}",
+        "─" * 65,
+        f"{'#':<6} {'LBA':<7} {'Secs':<6} {'Bytes':<10} {'Ext':<7} Description",
+        "─" * 65,
+    ]
+    for cf in results:
+        flags = ""
+        if cf.truncated:    flags += " [TRUNC]"
+        if cf.zero_stopped: flags += " [ZERO-STOP]"
+        lines.append(
+            f"{cf.index:<6} {cf.start_lba:<7} {cf.sector_count:<6} "
+            f"{cf.byte_size:<10} {cf.ext:<7} {cf.description}{flags}"
+        )
+    (out_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    return saved
+    log.info("Wrote %d file(s) → %s", len(results), out_dir)
+    log.info("Manifest : %s/manifest.json", out_dir)
+    log.info("Summary  : %s/summary.txt",   out_dir)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def list_signatures():
-    print(f"\n{'Magic (hex)':<28} {'Offset':>6}  {'Ext':<8}  Description")
-    print("-" * 70)
-    for magic, hdr_off, ext, desc in SIGNATURES:
-        hex_magic = magic.hex(" ") if len(magic) <= 8 else magic.hex(" ")[:23] + "…"
-        print(f"  {hex_magic:<26} {hdr_off:>6}  {ext:<8}  {desc}")
-    print(f"\n  + plain ASCII runs ≥ {TEXT_MIN_RUN} bytes → .txt")
-    print()
-
-
 def main():
     ap = argparse.ArgumentParser(
-        description="Carve files from a SOFTWARE PIRATES .cp2 disk image"
+        description="Carve files from a SOFTWARE PIRATES .cp2 image (no FAT required)"
     )
-    ap.add_argument("source", nargs="?",
+    ap.add_argument("source",
                     help=".cp2 file to carve")
-    ap.add_argument("--out", "-o",
-                    default="./carved",
-                    help="Output directory for recovered files (default: ./carved)")
-    ap.add_argument("--window", "-w",
-                    type=int, default=65536,
-                    help="Bytes to extract per hit (default: 65536 = 64 KB)")
-    ap.add_argument("--min-size", "-m",
-                    type=int, default=64,
-                    help="Minimum file size in bytes to save (default: 64)")
-    ap.add_argument("--list-sigs",
-                    action="store_true",
-                    help="Print the signature table and exit")
-    ap.add_argument("--verbose", "-v",
-                    action="store_true")
+    ap.add_argument("--out",        default="./carved", metavar="DIR",
+                    help="Output directory (default: ./carved)")
+    ap.add_argument("--aggressive", action="store_true",
+                    help="Also attempt .COM recovery (many false positives)")
+    ap.add_argument("--min-size",   type=int, default=16, metavar="BYTES",
+                    help="Discard hits smaller than N bytes (default: 16)")
+    ap.add_argument("--max-size",   type=int, default=0,  metavar="BYTES",
+                    help="Cap each carved file at N bytes, 0=unlimited (default: 0)")
+    ap.add_argument("--probe",      action="store_true",
+                    help="Print sector map and signature hits only — no files written")
+    ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
-
-    if args.list_sigs:
-        list_signatures()
-        sys.exit(0)
-
-    if not args.source:
-        ap.error("source is required unless --list-sigs is used")
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # ── Load and linearise ────────────────────────────────────────────────────
+    if not os.path.isfile(args.source):
+        log.error("Not a file: %r", args.source)
+        sys.exit(1)
+
     log.info("Reading  : %s", args.source)
     with open(args.source, "rb") as f:
         raw = f.read()
 
-    disk   = load_cp2(raw)
-    stream = linearise(disk)
-    log.info("Stream   : %d bytes  (%d sectors)", len(stream), len(stream) // 512)
-
-    # ── Carve ─────────────────────────────────────────────────────────────────
-    log.info("Carving  : window=%d  min-size=%d", args.window, args.min_size)
-    hits = carve(stream, args.window, args.min_size)
-
-    if not hits:
-        log.warning("No signatures found — disk may use an unsupported format")
+    # Parse CP2
+    try:
+        disk = load_cp2(raw)
+    except Exception as e:
+        log.error("CP2 parse failed: %s", e)
         sys.exit(1)
 
-    log.info("Found %d hit(s):", len(hits))
+    # Infer geometry
+    try:
+        max_cyl, num_heads, spt = infer_geometry(disk)
+    except ValueError as e:
+        log.error("Geometry inference failed: %s", e)
+        sys.exit(1)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    saved = save_hits(hits, args.out)
-    log.info("Saved %d file(s) to: %s", saved, args.out)
+    total_lbas = max_cyl * num_heads * spt
+    log.info("Geometry : %d cyl × %d head × %d sec/trk = %d LBAs  (%d KB)",
+             max_cyl, num_heads, spt, total_lbas, total_lbas * 512 // 1024)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    by_type = {}
-    for h in hits:
-        by_type.setdefault(h.ext, []).append(h)
-    print("\n── Summary ──────────────────────────────────────────────")
-    for ext, group in sorted(by_type.items()):
-        print(f"  {ext:<8} {len(group):>4}  hit(s)")
-    print(f"  {'TOTAL':<8} {len(hits):>4}")
-    print(f"\n  Output : {os.path.abspath(args.out)}")
-    print()
+    # Build flat LBA map
+    lba_map = build_lba_map(disk, max_cyl, num_heads, spt)
+    present = sum(1 for v in lba_map.values() if v is not None and v != ZERO_SECTOR)
+    log.info("Sectors  : %d with data, %d empty/missing",
+             present, total_lbas - present)
+
+    # Build combined signature index for probe/carve
+    sig_idx = dict(SIG_INDEX)
+    if args.aggressive:
+        for b0, entries in COM_SIG_INDEX.items():
+            sig_idx.setdefault(b0, []).extend(entries)
+
+    if args.probe:
+        probe_sectors(lba_map, total_lbas, sig_idx)
+        return
+
+    # Carve
+    log.info("Carving ...")
+    results = scan_and_carve(
+        lba_map    = lba_map,
+        total_lbas = total_lbas,
+        aggressive = args.aggressive,
+        min_size   = args.min_size,
+        max_size   = args.max_size,
+    )
+
+    if not results:
+        log.warning("No files found. Try --aggressive or inspect with --probe.")
+        sys.exit(0)
+
+    log.info("Found %d candidate file(s)", len(results))
+    write_results(results, Path(args.out))
+    log.info("Done.")
 
 
 if __name__ == "__main__":
