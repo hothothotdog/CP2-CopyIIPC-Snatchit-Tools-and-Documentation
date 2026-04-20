@@ -41,8 +41,8 @@ except ImportError:
 
 try:
     from cp2_recover import (
-        parse_bpb, guess_bpb_from_clusters,
-        infer_disk_geometry, build_lba_map, read_lba,
+        parse_bpb, guess_bpb_from_clusters, guess_bpb_from_fat_media,
+        infer_disk_geometry, build_lba_map, read_lba, _logical_spt,
     )
 except ImportError:
     sys.exit("ERROR: cp2_recover.py not found — place it alongside this script.")
@@ -208,13 +208,17 @@ def _check_geometry(disk: dict, result: CheckResult) -> dict | None:
 def _check_disk_extent(disk: dict, result: CheckResult) -> tuple:
     """Infer geometry, check for partial captures. Returns (max_cyl, num_heads, spt)."""
     num_heads = max(h for _, h in disk) + 1
-    sec_counts = [max(smap.keys()) for smap in disk.values() if smap]
+    # Use logical SPT (consecutive run 1..N) not raw max sector number.
+    # Mirrors the fix in cp2_recover.py so that copy-protected disks with
+    # non-sequential sector numbers (e.g. 1-8, 10, 12…27) get spt=8 not spt=27.
+    sec_counts = [_logical_spt(smap) for smap in disk.values() if smap]
     spt = max(set(sec_counts), key=sec_counts.count)
 
     all_cyls = sorted(set(c for c, _ in disk))
     true_max = 0
     for cyl in all_cyls:
-        if all(len(disk.get((cyl, h), {})) >= spt for h in range(num_heads)):
+        if all(_logical_spt(disk.get((cyl, h), {})) >= spt
+               for h in range(num_heads)):
             true_max = cyl
     max_cyl = true_max + 1
 
@@ -267,10 +271,16 @@ def _check_sectors(disk: dict, max_cyl: int, num_heads: int, spt: int,
     return lba_map
 
 
-def _check_bpb(lba_map: dict, disk: dict, result: CheckResult) -> tuple:
+def _check_bpb(lba_map: dict, disk: dict, spt: int, result: CheckResult) -> tuple:
     """
-    Try to read the BPB. Return (bpb, bpb_readable).
-    Populates hints with data_start and spc regardless of source.
+    Try to read the BPB using the same three-tier fallback chain as cp2_recover.py:
+      1. Parse BPB from boot sector (LBA 0)
+      2. Infer from FAT media descriptor byte (PC-DOS 1.x era, e.g. 0xFE)
+      3. Guess from standard floppy geometry constants
+
+    Records 'bpb_source' in disk_summary so _build_suggested_command knows
+    whether cp2_recover.py can handle the disk automatically (sources 1 and 2)
+    or needs manual override flags (source 3 or raw stream scan).
     """
     root_log = logging.getLogger()
     prev_level = root_log.level
@@ -280,61 +290,78 @@ def _check_bpb(lba_map: dict, disk: dict, result: CheckResult) -> tuple:
     bpb = parse_bpb(sector0)
     bpb_readable = bpb is not None
 
-    if not bpb_readable:
-        result.issues.append(Issue("WARN", "BPB_UNREADABLE",
-            f"The boot sector does not contain a recognisable FAT12 BPB "
-            f"(jump byte 0x{sector0[0]:02X} is not 0xEB or 0xE9, or other fields are zero). "
-            f"cp2_recover.py will use a geometry fallback, but manual override flags "
-            f"may be needed for correct extraction."))
-        bpb = guess_bpb_from_clusters(disk)
+    if bpb_readable:
+        bpb_source = "BPB"
+    else:
+        # Tier 2: FAT media descriptor (handles copy-protected / pre-BPB disks)
+        bpb = guess_bpb_from_fat_media(disk, lba_map, spt)
+        if bpb:
+            bpb_source = f"FAT media byte 0x{bpb.media_byte:02X}"
+            result.issues.append(Issue("INFO", "BPB_FROM_MEDIA_BYTE",
+                f"Boot sector does not contain a standard FAT12 BPB "
+                f"(jump byte 0x{sector0[0]:02X}), but the FAT media descriptor "
+                f"0x{bpb.media_byte:02X} identifies the disk geometry unambiguously. "
+                f"cp2_recover.py handles this automatically — no override flags needed."))
+        else:
+            # Tier 3: standard geometry constants (may need manual override)
+            bpb = guess_bpb_from_clusters(disk)
+            bpb_source = "geometry guess"
+            result.issues.append(Issue("WARN", "BPB_UNREADABLE",
+                f"The boot sector does not contain a recognisable FAT12 BPB "
+                f"(jump byte 0x{sector0[0]:02X} is not 0xEB or 0xE9, or other fields "
+                f"are zero), and the FAT media byte did not match a known format. "
+                f"cp2_recover.py will use a geometry fallback, but manual override "
+                f"flags may be needed for correct extraction."))
 
     root_log.setLevel(prev_level)
 
     if bpb:
         result.hints["data_start"] = bpb.data_start
         result.hints["spc"]        = bpb.sectors_per_clus
-        result.disk_summary["data_start_lba"] = bpb.data_start
-        result.disk_summary["sectors_per_cluster"] = bpb.sectors_per_clus
-        result.disk_summary["bpb_readable"] = bpb_readable
+        result.disk_summary["data_start_lba"]       = bpb.data_start
+        result.disk_summary["sectors_per_cluster"]  = bpb.sectors_per_clus
+        result.disk_summary["bpb_readable"]         = bpb_readable
+        result.disk_summary["bpb_source"]           = bpb_source
 
-    return bpb, bpb_readable
+    return bpb, bpb_readable, bpb_source
 
 
-def _check_directory(raw: bytes, lba_map: dict, bpb, bpb_readable: bool,
+def _check_directory(raw: bytes, lba_map: dict, bpb, bpb_source: str,
                      result: CheckResult):
     """
     Try to find and parse the root directory.
-    When the BPB is readable, use the LBA map first.
-    When unreadable, or when the LBA path yields garbage, fall back to
-    scanning the raw CP2 byte stream directly.
-    """
-    files_from_bpb = []
 
-    if bpb and bpb_readable:
-        # Only attempt BPB-guided read when BPB is genuinely readable —
-        # a guessed BPB may point root_dir_start at FAT/data sectors.
+    The LBA-map path is trusted when the BPB came from a real boot sector or
+    from the FAT media descriptor — both give reliable geometry.  The raw
+    byte-stream scan is the fallback for geometry-guessed cases, or as
+    confirmation when the LBA path fails.
+    """
+    auto_detectable = (bpb_source == "BPB") or bpb_source.startswith("FAT media byte")
+    files_from_bpb  = []
+
+    if bpb and auto_detectable:
         from cp2_recover import read_dir_sectors, ATTR_VOLUME_ID, ATTR_DIRECTORY
         try:
             entries = read_dir_sectors(lba_map, bpb.root_dir_start,
                                        bpb.root_dir_sectors, skip_zero_sectors=True)
             for de in entries:
+                if de.is_deleted:
+                    continue
                 if de.attr & (ATTR_VOLUME_ID | ATTR_DIRECTORY):
                     continue
                 if de.file_size == 0 and de.start_cluster == 0:
                     continue
-                # Sanity-check: filenames must be printable ASCII
                 name_ok = all(0x20 <= ord(c) < 0x7F for c in de.raw_name
                               if c not in (' ', '\x00'))
                 if not name_ok:
                     continue
-                if de.file_size > 0x200000:   # >2MB on a floppy is garbage
+                if de.file_size > 0x200000:
                     continue
                 files_from_bpb.append((de.filename, de.start_cluster, de.file_size))
         except Exception:
             pass
 
-    # Always scan the raw CP2 byte stream — it's the ground truth for
-    # non-standard disks where sectors are stored in interleaved order.
+    # Always scan the raw CP2 byte stream as fallback / ground truth
     dir_offset_raw = _scan_for_directory(raw)
     files_from_raw = []
     if dir_offset_raw is not None:
@@ -342,6 +369,8 @@ def _check_directory(raw: bytes, lba_map: dict, bpb, bpb_readable: bool,
         dir_bytes = raw[dir_offset_raw:dir_offset_raw + 512]
         entries   = parse_dir_bytes(dir_bytes)
         for de in entries:
+            if de.is_deleted:
+                continue
             if de.attr & (ATTR_VOLUME_ID | ATTR_DIRECTORY):
                 continue
             if de.file_size == 0 and de.start_cluster == 0:
@@ -352,26 +381,27 @@ def _check_directory(raw: bytes, lba_map: dict, bpb, bpb_readable: bool,
                 continue
             files_from_raw.append((de.filename, de.start_cluster, de.file_size))
 
-    # Choose the best source: BPB path when it found clean entries,
-    # raw stream otherwise (handles non-standard BPBs like FLASH604).
     if files_from_bpb:
-        result.disk_summary["files_found"]   = len(files_from_bpb)
-        result.disk_summary["dir_source"]    = "BPB (LBA map)"
-        result.disk_summary["file_listing"]  = files_from_bpb
-        # If the raw scan ALSO found entries at a different offset, note it
-        if files_from_raw and dir_offset_raw is not None:
-            result.hints["cp2_dir_offset_alt"] = f"0x{dir_offset_raw:X}"
+        result.disk_summary["files_found"]      = len(files_from_bpb)
+        result.disk_summary["dir_source"]       = f"LBA map ({bpb_source})"
+        result.disk_summary["file_listing"]     = files_from_bpb
+        result.disk_summary["auto_recoverable"] = True
+        # cp2_recover.py will detect this geometry automatically — no flags needed
+        result.hints.pop("data_start", None)
+        result.hints.pop("spc",        None)
     elif files_from_raw:
-        result.disk_summary["files_found"]   = len(files_from_raw)
-        result.disk_summary["dir_source"]    = f"raw CP2 offset 0x{dir_offset_raw:X}"
-        result.disk_summary["file_listing"]  = files_from_raw
-        result.hints["cp2_dir_offset"]       = f"0x{dir_offset_raw:X}"
+        result.disk_summary["files_found"]      = len(files_from_raw)
+        result.disk_summary["dir_source"]       = f"raw CP2 offset 0x{dir_offset_raw:X}"
+        result.disk_summary["file_listing"]     = files_from_raw
+        result.disk_summary["auto_recoverable"] = False
+        result.hints["cp2_dir_offset"]          = f"0x{dir_offset_raw:X}"
         result.issues.append(Issue("INFO", "DIR_FOUND_IN_RAW_STREAM",
             f"Directory entries found at CP2 file offset 0x{dir_offset_raw:X} "
             f"({len(files_from_raw)} file(s)) by scanning the raw byte stream. "
-            f"The BPB-guided LBA path could not locate them — use "
+            f"The LBA-map path could not locate them — use "
             f"--cp2-dir-offset 0x{dir_offset_raw:X} with cp2_recover.py."))
     else:
+        result.disk_summary["auto_recoverable"] = False
         result.issues.append(Issue("ERROR", "NO_DIRECTORY",
             "Could not locate any readable FAT12 root directory entries, "
             "either via the BPB or by scanning the raw CP2 byte stream. "
@@ -448,8 +478,8 @@ def check_cp2(path: Path) -> CheckResult:
 
     max_cyl, num_heads, spt = _check_disk_extent(disk, result)
     lba_map  = _check_sectors(disk, max_cyl, num_heads, spt, result)
-    bpb, bpb_readable = _check_bpb(lba_map, disk, result)
-    _check_directory(raw, lba_map, bpb, bpb_readable, result)
+    bpb, bpb_readable, bpb_source = _check_bpb(lba_map, disk, spt, result)
+    _check_directory(raw, lba_map, bpb, bpb_source, result)
 
     return result
 
@@ -458,19 +488,27 @@ def check_cp2(path: Path) -> CheckResult:
 
 def _build_suggested_command(result: CheckResult) -> str:
     """
-    Construct a suggested cp2_recover.py command line with actual values
-    derived from the checks.
+    Construct a suggested cp2_recover.py command line.
+
+    When cp2_recover.py can handle the disk automatically (BPB readable, or
+    geometry derived from FAT media descriptor), no override flags are needed
+    and the command is kept minimal.  Manual flags are only emitted when the
+    checker determined they are genuinely required.
     """
     h     = result.hints
     fname = result.path.name
     stem  = result.path.stem
     parts = [f"python cp2_recover.py {fname}"]
 
+    # If the disk was located via LBA map with auto-detected geometry,
+    # cp2_recover.py needs no flags at all.
+    if result.disk_summary.get("auto_recoverable", False):
+        parts.append(f"  --out ./recovered_{stem}")
+        return " \\\n".join(parts)
+
+    # Otherwise emit the flags the checker determined are necessary
     if "cp2_dir_offset" in h:
         parts.append(f"  --cp2-dir-offset {h['cp2_dir_offset']}")
-        if result.disk_summary.get("sectors_per_cluster", 2) != 2:
-            # non-default size — include
-            parts.append(f"  --cp2-dir-size 512")
 
     if "data_start" in h:
         parts.append(f"  --data-start {h['data_start']}")
@@ -478,12 +516,11 @@ def _build_suggested_command(result: CheckResult) -> str:
     if "spc" in h:
         parts.append(f"  --spc {h['spc']}")
 
-    # If BPB was not readable, also suggest the fallback flags
-    if not result.disk_summary.get("bpb_readable", True):
+    bpb_source = result.disk_summary.get("bpb_source", "")
+    if bpb_source == "geometry guess":
         parts.append(f"  --skip-zero-sectors")
 
     parts.append(f"  --out ./recovered_{stem}")
-
     return " \\\n".join(parts)
 
 
@@ -587,14 +624,19 @@ def generate_report(result: CheckResult) -> str:
     if "BAD_GEOMETRY" in codes:
         lines.append("  The geometry contamination is handled automatically — no extra")
         lines.append("  flags are needed for cp2_to_img.py or cp2_recover.py.")
+    if "BPB_FROM_MEDIA_BYTE" in codes:
+        lines.append("  The disk uses a pre-BPB PC-DOS format. cp2_recover.py detects")
+        lines.append("  this automatically from the FAT media descriptor byte — no")
+        lines.append("  override flags are needed.")
     if "PARTIAL_DISK" in codes:
         lines.append("  Files whose cluster chains extend beyond the recovered cylinders")
         lines.append("  will be zero-padded in the output. Only the first few files on")
         lines.append("  the disk will be fully intact.")
     if "BPB_UNREADABLE" in codes:
-        lines.append("  Because the BPB is corrupt, --data-start and --spc must be")
-        lines.append("  supplied manually. The values shown above are derived from the")
-        lines.append("  cluster gap analysis of the directory entries.")
+        lines.append("  Because the BPB is corrupt and no standard media descriptor was")
+        lines.append("  found, --data-start and --spc must be supplied manually. The")
+        lines.append("  values shown above are derived from the cluster gap analysis of")
+        lines.append("  the directory entries.")
     if "DIR_FOUND_IN_RAW_STREAM" in codes:
         lines.append("  --cp2-dir-offset bypasses the LBA map and reads directory entries")
         lines.append("  directly from the CP2 file's byte stream at the given offset.")
