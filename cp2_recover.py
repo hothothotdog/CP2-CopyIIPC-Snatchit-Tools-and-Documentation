@@ -209,52 +209,65 @@ def guess_bpb_from_fat_media(disk: dict, lba_map: dict, spt: int) -> BPB | None:
     to reconstruct a BPB for early PC-DOS formats that predate the BPB field
     (or use a non-standard boot sector jump).
 
-    The FAT is at LBA 1 on a standard single-FAT layout (reserved=1 sector).
-    If the first byte of that sector is a known media descriptor (0xFE–0xFF
-    or 0xF0), and the second and third bytes are both 0xFF (the standard
-    FAT12 padding), we treat the layout as definitive.
+    The FAT is normally at LBA 1 (reserved=1 sector), but some disks with
+    non-standard layouts place it at LBA 2.  We try both.  Sectors stored as
+    zero-length bytes (b'') due to bad size codes in the CP2 are treated as
+    absent — read_lba already handles this, but we add an explicit length
+    guard here as a belt-and-suspenders defence.
+
+    A valid FAT start is identified by: first byte in MEDIA_GEOMETRIES, and
+    second and third bytes both 0xFF (standard FAT12 padding).
     """
-    fat_sector = read_lba(lba_map, 1)
-    med  = fat_sector[0]
-    pad1 = fat_sector[1]
-    pad2 = fat_sector[2]
+    for fat_lba in (1, 2):
+        fat_sector = read_lba(lba_map, fat_lba)
+        if len(fat_sector) < 3:
+            log.debug("guess_bpb_from_fat_media: LBA %d is short (%d bytes) — skipping",
+                      fat_lba, len(fat_sector))
+            continue
 
-    if med not in MEDIA_GEOMETRIES or pad1 != 0xFF or pad2 != 0xFF:
-        log.debug("guess_bpb_from_fat_media: LBA 1 first bytes %02X %02X %02X — not a FAT",
-                  med, pad1, pad2)
-        return None
+        med  = fat_sector[0]
+        pad1 = fat_sector[1]
+        pad2 = fat_sector[2]
 
-    nhead, spt_fat, cyls, res, nfat, fatsz, rde, spc = MEDIA_GEOMETRIES[med]
+        if med not in MEDIA_GEOMETRIES or pad1 != 0xFF or pad2 != 0xFF:
+            log.debug("guess_bpb_from_fat_media: LBA %d first bytes %02X %02X %02X — not a FAT",
+                      fat_lba, med, pad1, pad2)
+            continue
 
-    # For 0xF9 distinguish 720 KB (9 spt) from 1.2 MB (15 spt) using inferred spt
-    if med == 0xF9 and spt == 15:
-        nhead, spt_fat, cyls, res, nfat, fatsz, rde, spc = (2, 15, 80, 1, 2, 7, 224, 1)
+        nhead, spt_fat, cyls, res, nfat, fatsz, rde, spc = MEDIA_GEOMETRIES[med]
 
-    rds        = (rde * 32 + 511) // 512
-    data_start = res + nfat * fatsz + rds
-    tsec       = cyls * nhead * spt_fat
-    tc         = (tsec - data_start) // spc if spc else 0
+        # For 0xF9 distinguish 720 KB (9 spt) from 1.2 MB (15 spt) using inferred spt
+        if med == 0xF9 and spt == 15:
+            nhead, spt_fat, cyls, res, nfat, fatsz, rde, spc = (2, 15, 80, 1, 2, 7, 224, 1)
 
-    log.info("BPB      : inferred from FAT media byte 0x%02X → %d cyl × %d head × %d spt (%d KB)",
-             med, cyls, nhead, spt_fat, tsec * 512 // 1024)
+        rds        = (rde * 32 + 511) // 512
+        data_start = res + nfat * fatsz + rds
+        tsec       = cyls * nhead * spt_fat
+        tc         = (tsec - data_start) // spc if spc else 0
 
-    return BPB(
-        oem_name          = f"(media=0x{med:02X})",
-        bytes_per_sector  = 512,
-        sectors_per_clus  = spc,
-        reserved_sectors  = res,
-        num_fats          = nfat,
-        root_entry_count  = rde,
-        total_sectors_16  = tsec,
-        media_byte        = med,
-        fat_size_16       = fatsz,
-        sectors_per_track = spt_fat,
-        num_heads         = nhead,
-        root_dir_start    = res + nfat * fatsz,
-        root_dir_sectors  = rds,
-        data_start        = data_start,
-        total_clusters    = tc,
-    )
+        log.info("BPB      : inferred from FAT media byte 0x%02X at LBA %d"
+                 " → %d cyl × %d head × %d spt (%d KB)",
+                 med, fat_lba, cyls, nhead, spt_fat, tsec * 512 // 1024)
+
+        return BPB(
+            oem_name          = f"(media=0x{med:02X})",
+            bytes_per_sector  = 512,
+            sectors_per_clus  = spc,
+            reserved_sectors  = res,
+            num_fats          = nfat,
+            root_entry_count  = rde,
+            total_sectors_16  = tsec,
+            media_byte        = med,
+            fat_size_16       = fatsz,
+            sectors_per_track = spt_fat,
+            num_heads         = nhead,
+            root_dir_start    = res + nfat * fatsz,
+            root_dir_sectors  = rds,
+            data_start        = data_start,
+            total_clusters    = tc,
+        )
+
+    return None
 
 def _logical_spt(smap: dict) -> int:
     """
@@ -320,9 +333,17 @@ def build_lba_map(disk: dict, max_cyl: int, num_heads: int, spt: int) -> dict:
 
 
 def read_lba(lba_map: dict, lba: int) -> bytes:
-    """Read a single 512-byte sector; returns zero sector if missing."""
+    """Read a single 512-byte sector; returns zero sector if missing or empty.
+
+    Sectors stored as zero-length bytes (b'') arise when the CP2 parser
+    records a sector with size-code N>6 or N=0 and no data offset — the
+    sector exists in the directory but carries no usable data.  Treat them
+    identically to absent sectors rather than propagating the empty buffer.
+    """
     data = lba_map.get(lba)
-    return data if data is not None else bytes(512)
+    if not data:   # handles None and b''
+        return bytes(512)
+    return data
 
 
 # ── Directory parsing ─────────────────────────────────────────────────────────
