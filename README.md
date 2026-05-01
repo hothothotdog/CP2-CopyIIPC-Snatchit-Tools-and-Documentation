@@ -1,3 +1,13 @@
+This repository has moved to [[https://codeberg.org/hothothotdog/search_extract](https://codeberg.org/hothothotdog/search_extract)
+
+This GitHub copy is a frozen archive. New commits, issues, and pull requests should go to Codeberg.
+
+---
+
+
+
+
+
 # cp2-tools
 
 A Python toolkit for converting, recovering, and validating floppy disk
