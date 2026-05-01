@@ -1,4 +1,4 @@
-This repository has moved to [[https://codeberg.org/hothothotdog/search_extract](https://codeberg.org/hothothotdog/search_extract)
+This repository has moved to [https://codeberg.org/hothothotdog/CP2-CopyIIPC-Snatchit-Tools-and-Documentation](https://codeberg.org/hothothotdog/CP2-CopyIIPC-Snatchit-Tools-and-Documentation)
 
 This GitHub copy is a frozen archive. New commits, issues, and pull requests should go to Codeberg.
 
